@@ -45,7 +45,7 @@ export default function MyAppointments() {
       </div>
 
       {error && <p className="alert alert--error">{error}</p>}
-      {!loading && shown.length === 0 && <p className="empty-block">Nothing here right now. New visits appear when the super admin assigns them to you.</p>}
+      {!loading && shown.length === 0 && <p className="empty-block">Nothing here right now. New visits appear when a project manager assigns them to you.</p>}
 
       <div className="visit-list">
         {shown.map((a) => (

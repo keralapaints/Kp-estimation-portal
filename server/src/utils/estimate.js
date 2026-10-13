@@ -1,80 +1,81 @@
 const { httpError } = require('./helpers');
+const { CATEGORY_KEYS, byKey } = require('./categories');
 
+const num = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
 const round2 = (n) => Math.round(n * 100) / 100;
-const ceilTo = (n, step) => Math.ceil(n / step) * step;
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /**
- * Turns site-visit measurements into a priced estimate.
- * surfaces:  [{ surfaceType, tier, label, area, coats, condition:{dampness,cracks,flaking} }]
- * rateCards: RateCard documents
- * settings:  Settings document
+ * Cleans what the inspector submitted and calculates every sq ft on the server.
+ * effective sq ft of a surface = length x height - (each deduction length x height x qty)
  */
-function computeEstimate(surfaces, rateCards, settings) {
-  if (!Array.isArray(surfaces) || surfaces.length === 0) {
-    throw httpError(400, 'Add at least one surface to generate an estimate');
-  }
+function normalizeSiteVisit(input = {}) {
+  const categories = [...new Set((input.categories || []).filter((c) => CATEGORY_KEYS.includes(c)))];
+  if (!categories.length) throw httpError(400, 'Tick at least one work category');
 
-  const lineItems = [];
-  let totalArea = 0;
-
-  surfaces.forEach((s, i) => {
-    const area = Number(s.area);
-    if (!(area > 0)) throw httpError(400, `Surface ${i + 1}: enter an area greater than 0`);
-
-    const rc = rateCards.find((r) => r.surfaceType === s.surfaceType && r.tier === s.tier);
-    if (!rc) throw httpError(400, `No rate card for ${s.surfaceType} / ${s.tier}. Add it under Rate card.`);
-
-    totalArea += area;
-    const label = (s.label || '').trim() || `${cap(s.surfaceType)} ${i + 1}`;
-    const coats = Number(s.coats) || rc.defaultCoats || 2;
-    const c = s.condition || {};
-
-    const add = (category, description, qty, unit, rate) => {
-      qty = round2(qty);
-      lineItems.push({ surfaceLabel: label, category, description, qty, unit, rate, amount: round2(qty * rate) });
-    };
-
-    // Materials
-    add('material', `${rc.productName} - ${coats} coat${coats > 1 ? 's' : ''}`, ceilTo((area * coats) / rc.paintCoverage, 0.5), 'L', rc.paintPrice);
-    if (rc.primerCoverage > 0) {
-      add('material', rc.primerName || 'Primer', ceilTo(area / rc.primerCoverage, 0.5), 'L', rc.primerPrice);
-    }
-    if (rc.puttyCoverage > 0) {
-      const puttyCoats = c.cracks || c.flaking ? 2 : 1;
-      add('material', `${rc.puttyName || 'Wall putty'} - ${puttyCoats} coat${puttyCoats > 1 ? 's' : ''}`, Math.ceil((area * puttyCoats) / rc.puttyCoverage), 'kg', rc.puttyPrice);
-    }
-
-    // Surface preparation based on condition
-    if (c.flaking) add('prep', 'Scraping loose paint', area, 'sq ft', settings.scrapingRate);
-    if (c.cracks) add('prep', 'Crack filling and sanding', area, 'sq ft', settings.crackRepairRate);
-    if (c.dampness && c.dampness !== 'none') {
-      add('prep', `Damp treatment (${c.dampness})`, area, 'sq ft', settings.dampTreatment[c.dampness]);
-    }
-
-    // Labour
-    add('labour', 'Application labour', area, 'sq ft', rc.labourRate);
+  const sections = categories.map((category) => {
+    const raw = (input.sections || []).find((s) => s.category === category) || { areas: [] };
+    const cat = byKey(category);
+    const areas = (raw.areas || []).map((a) => {
+      const surfaces = (a.surfaces || []).map((s) => {
+        const deductions = (s.deductions || [])
+          .map((d) => ({ label: String(d.label || 'Opening').slice(0, 40), length: num(d.length), height: num(d.height), qty: Math.max(1, Math.round(num(d.qty) || 1)) }))
+          .filter((d) => d.length > 0 && d.height > 0);
+        const gross = num(s.length) * num(s.height);
+        const minus = deductions.reduce((t, d) => t + d.length * d.height * d.qty, 0);
+        return {
+          type: String(s.type || 'Wall').slice(0, 40),
+          length: num(s.length),
+          height: num(s.height),
+          deductions,
+          sqft: round2(Math.max(0, gross - minus)),
+          colorCode: cat.color ? String(s.colorCode || '').trim().slice(0, 40) : '',
+          photos: (s.photos || []).filter((p) => /^[a-f0-9]{24}$/i.test(String(p))).slice(0, 10),
+        };
+      });
+      return {
+        room: String(a.room || '').slice(0, 60),
+        name: String(a.name || '').trim().slice(0, 60),
+        surfaces,
+        sqft: round2(surfaces.reduce((t, s) => t + s.sqft, 0)),
+      };
+    });
+    return { category, areas, sqft: round2(areas.reduce((t, a) => t + a.sqft, 0)) };
   });
 
-  const sum = (cat) => round2(lineItems.filter((l) => l.category === cat).reduce((a, l) => a + l.amount, 0));
-  const materialTotal = sum('material');
-  const prepTotal = sum('prep');
-  const labourTotal = sum('labour');
-  const subtotal = round2(materialTotal + prepTotal + labourTotal);
-  const gstRate = settings.gstRate;
-  const gst = round2((subtotal * gstRate) / 100);
+  return { categories, sections, notes: String(input.notes || '').slice(0, 2000) };
+}
+
+/**
+ * Prices the measured sq ft as the three customer options (packages).
+ * rates:    RateCard docs { category, tier, rate }
+ * settings: { gstRate, packages: [{ key, label, interior, exterior }] }
+ */
+function computeEstimate(siteVisit, rates, settings) {
+  const categories = siteVisit.sections
+    .filter((s) => s.sqft > 0)
+    .map((s) => ({ category: s.category, label: byKey(s.category).label, sqft: s.sqft }));
+  if (!categories.length) throw httpError(400, 'Enter measurements: every category has 0 sq ft');
+
+  const options = settings.packages.map((p) => {
+    const lines = categories.map((c) => {
+      const cat = byKey(c.category);
+      const tier = cat.tiered ? p[cat.side] : 'flat';
+      const r = rates.find((x) => x.category === c.category && x.tier === tier);
+      if (!r) throw httpError(400, `No rate for ${cat.label} (${tier}). Add it on the Rate card page.`);
+      return { category: c.category, label: cat.label, sqft: c.sqft, tier, rate: r.rate, amount: round2(c.sqft * r.rate) };
+    });
+    const subtotal = round2(lines.reduce((t, l) => t + l.amount, 0));
+    const gst = round2((subtotal * settings.gstRate) / 100);
+    return { key: p.key, label: p.label, interior: p.interior, exterior: p.exterior, lines, subtotal, gstRate: settings.gstRate, gst, total: round2(subtotal + gst) };
+  });
 
   return {
-    lineItems,
-    totalArea: round2(totalArea),
-    materialTotal,
-    prepTotal,
-    labourTotal,
-    subtotal,
-    gstRate,
-    gst,
-    total: round2(subtotal + gst),
+    categories,
+    totalSqft: round2(categories.reduce((t, c) => t + c.sqft, 0)),
+    options,
+    selectedOption: null,
+    total: Math.min(...options.map((o) => o.total)),
   };
 }
 
-module.exports = { computeEstimate };
+module.exports = { normalizeSiteVisit, computeEstimate };

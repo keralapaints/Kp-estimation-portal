@@ -6,94 +6,133 @@ const RateCard = require('../models/RateCard');
 const Settings = require('../models/Settings');
 const { protect, allow } = require('../middleware/auth');
 const { ah, escapeRegex, pushHistory, OPEN_STATUSES } = require('../utils/helpers');
+const { byKey, TIERS } = require('../utils/categories');
 
 router.use(protect, allow('superadmin'));
 
+// Roles the super admin (team lead) can create
+const TEAM_ROLES = ['crm', 'project_manager', 'manager'];
+const ROLE_NAME = { crm: 'CRM', project_manager: 'Project manager', manager: 'Field inspector' };
+
 /* ---------- Dashboard ---------- */
 router.get('/stats', ah(async (req, res) => {
-  const [byStatus, managers, unassigned] = await Promise.all([
+  const [byStatus, team, newLeads, approvedValue] = await Promise.all([
     Appointment.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
-    User.countDocuments({ role: 'manager', active: true }),
-    Appointment.find({ status: 'new' }).sort({ createdAt: -1 }).limit(8)
-      .populate('suggestedManager', 'name').lean(),
+    User.aggregate([{ $match: { role: { $in: TEAM_ROLES }, active: true } }, { $group: { _id: '$role', count: { $sum: 1 } } }]),
+    Appointment.find({ status: 'new' }).sort({ createdAt: -1 }).limit(8).lean(),
+    Appointment.aggregate([
+      { $match: { status: { $in: ['approved', 'completed'] } } },
+      { $group: { _id: null, total: { $sum: '$estimate.total' } } },
+    ]),
   ]);
-  const counts = Object.fromEntries(byStatus.map((s) => [s._id, s.count]));
-  const approvedValue = await Appointment.aggregate([
-    { $match: { status: { $in: ['approved', 'completed'] } } },
-    { $group: { _id: null, total: { $sum: '$estimate.total' } } },
-  ]);
-  res.json({ counts, managers, unassigned, approvedValue: approvedValue[0]?.total || 0 });
+  res.json({
+    counts: Object.fromEntries(byStatus.map((s) => [s._id, s.count])),
+    team: Object.fromEntries(team.map((t) => [t._id, t.count])),
+    newLeads,
+    approvedValue: approvedValue[0]?.total || 0,
+  });
 }));
 
-/* ---------- Managers CRUD ---------- */
+/* ---------- Team (CRM, project managers, field inspectors) CRUD ---------- */
 const parsePincodes = (p) =>
   (Array.isArray(p) ? p : String(p || '').split(/[\s,]+/)).map((x) => String(x).trim()).filter((x) => /^\d{6}$/.test(x));
 
-router.get('/managers', ah(async (req, res) => {
-  const managers = await User.find({ role: 'manager' }).sort({ createdAt: -1 }).lean();
-  const counts = await Appointment.aggregate([
-    { $match: { assignedTo: { $ne: null } } },
-    { $group: {
-      _id: '$assignedTo',
-      total: { $sum: 1 },
-      open: { $sum: { $cond: [{ $in: ['$status', OPEN_STATUSES] }, 1, 0] } },
-    } },
+router.get('/users', ah(async (req, res) => {
+  const filter = { role: TEAM_ROLES.includes(req.query.role) ? req.query.role : { $in: TEAM_ROLES } };
+  const users = await User.find(filter).sort({ role: 1, createdAt: -1 }).lean();
+
+  const [inspectorJobs, crmJobs] = await Promise.all([
+    Appointment.aggregate([
+      { $match: { assignedTo: { $ne: null } } },
+      { $group: { _id: '$assignedTo', total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ['$status', OPEN_STATUSES] }, 1, 0] } } } },
+    ]),
+    Appointment.aggregate([
+      { $match: { assignedCrm: { $ne: null } } },
+      { $group: { _id: '$assignedCrm', total: { $sum: 1 }, open: { $sum: { $cond: [{ $eq: ['$status', 'crm_assigned'] }, 1, 0] } } } },
+    ]),
   ]);
-  const map = Object.fromEntries(counts.map((c) => [String(c._id), c]));
-  res.json(managers.map((m) => ({ ...m, openJobs: map[m._id]?.open || 0, totalJobs: map[m._id]?.total || 0 })));
+  const ins = Object.fromEntries(inspectorJobs.map((c) => [String(c._id), c]));
+  const crm = Object.fromEntries(crmJobs.map((c) => [String(c._id), c]));
+
+  res.json(users.map((u) => {
+    const c = u.role === 'crm' ? crm[u._id] : u.role === 'manager' ? ins[u._id] : null;
+    return { ...u, openJobs: c?.open || 0, totalJobs: c?.total || 0 };
+  }));
 }));
 
-router.post('/managers', ah(async (req, res) => {
-  const { name, email, phone, password, region, pincodes, active } = req.body;
+router.post('/users', ah(async (req, res) => {
+  const { name, email, phone, password, role, region, pincodes, active } = req.body;
   if (!name || !email || !password) return res.status(400).json({ message: 'Name, email and password are required' });
+  if (!TEAM_ROLES.includes(role)) return res.status(400).json({ message: 'Choose a role' });
   if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
-  const m = await User.create({ name, email, phone, password, region, pincodes: parsePincodes(pincodes), active: active !== false, role: 'manager' });
-  const { password: _, ...safe } = m.toObject();
+  const u = await User.create({ name, email, phone, password, role, region, pincodes: parsePincodes(pincodes), active: active !== false });
+  const { password: _, ...safe } = u.toObject();
   res.status(201).json(safe);
 }));
 
-router.put('/managers/:id', ah(async (req, res) => {
-  const m = await User.findOne({ _id: req.params.id, role: 'manager' });
-  if (!m) return res.status(404).json({ message: 'Manager not found' });
-  const { name, email, phone, password, region, pincodes, active } = req.body;
-  if (name !== undefined) m.name = name;
-  if (email !== undefined) m.email = email;
-  if (phone !== undefined) m.phone = phone;
-  if (region !== undefined) m.region = region;
-  if (pincodes !== undefined) m.pincodes = parsePincodes(pincodes);
-  if (active !== undefined) m.active = !!active;
+router.put('/users/:id', ah(async (req, res) => {
+  const u = await User.findOne({ _id: req.params.id, role: { $in: TEAM_ROLES } });
+  if (!u) return res.status(404).json({ message: 'User not found' });
+  const { name, email, phone, password, role, region, pincodes, active } = req.body;
+  if (name !== undefined) u.name = name;
+  if (email !== undefined) u.email = email;
+  if (phone !== undefined) u.phone = phone;
+  if (region !== undefined) u.region = region;
+  if (pincodes !== undefined) u.pincodes = parsePincodes(pincodes);
+  if (active !== undefined) u.active = !!active;
+  if (role !== undefined) {
+    if (!TEAM_ROLES.includes(role)) return res.status(400).json({ message: 'Choose a valid role' });
+    u.role = role;
+  }
   if (password) {
     if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
-    m.password = password;
+    u.password = password;
   }
-  await m.save();
-  const { password: _, ...safe } = m.toObject();
+  await u.save();
+  const { password: _, ...safe } = u.toObject();
   res.json(safe);
 }));
 
-router.delete('/managers/:id', ah(async (req, res) => {
-  const m = await User.findOne({ _id: req.params.id, role: 'manager' });
-  if (!m) return res.status(404).json({ message: 'Manager not found' });
+router.delete('/users/:id', ah(async (req, res) => {
+  const u = await User.findOne({ _id: req.params.id, role: { $in: TEAM_ROLES } });
+  if (!u) return res.status(404).json({ message: 'User not found' });
 
-  // Return this manager's open jobs to the unassigned queue
-  const open = await Appointment.find({ assignedTo: m._id, status: { $in: OPEN_STATUSES } });
-  for (const a of open) {
-    a.assignedTo = null;
-    if (['assigned', 'scheduled'].includes(a.status)) a.status = 'new';
-    pushHistory(a, 'Unassigned', req.user, `Manager ${m.name} was removed`);
-    await a.save();
+  let returned = 0;
+  if (u.role === 'crm') {
+    // Leads still being verified go back to the team lead
+    const open = await Appointment.find({ assignedCrm: u._id, status: 'crm_assigned' });
+    for (const a of open) {
+      a.assignedCrm = null;
+      a.status = 'new';
+      pushHistory(a, 'CRM unassigned', req.user, `${u.name} was removed`);
+      await a.save();
+    }
+    returned = open.length;
   }
-  await m.deleteOne();
-  res.json({ message: 'Manager deleted', reassignedCount: open.length });
+  if (u.role === 'manager') {
+    // Inspector's open jobs go back to the project manager queue
+    const open = await Appointment.find({ assignedTo: u._id, status: { $in: OPEN_STATUSES } });
+    for (const a of open) {
+      a.assignedTo = null;
+      if (['assigned', 'scheduled'].includes(a.status)) a.status = 'awaiting_inspection';
+      pushHistory(a, 'Inspector unassigned', req.user, `${u.name} was removed`);
+      await a.save();
+    }
+    returned = open.length;
+  }
+  await u.deleteOne();
+  res.json({ message: `${ROLE_NAME[u.role]} deleted`, returnedCount: returned });
 }));
 
 /* ---------- Appointments ---------- */
 router.get('/appointments', ah(async (req, res) => {
-  const { status, manager, q } = req.query;
+  const { status, crm, manager, q } = req.query;
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, parseInt(req.query.limit) || 20);
   const filter = {};
   if (status) filter.status = { $in: String(status).split(',') };
+  if (crm === 'unassigned') filter.assignedCrm = null;
+  else if (crm && mongoose.isValidObjectId(crm)) filter.assignedCrm = crm;
   if (manager === 'unassigned') filter.assignedTo = null;
   else if (manager && mongoose.isValidObjectId(manager)) filter.assignedTo = manager;
   if (q) {
@@ -102,8 +141,8 @@ router.get('/appointments', ah(async (req, res) => {
   }
   const [items, total] = await Promise.all([
     Appointment.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit)
-      .select('-history -estimate.lineItems')
-      .populate('assignedTo', 'name').populate('suggestedManager', 'name').lean(),
+            .select('-history -siteVisit -estimate.options')
+      .populate('assignedCrm', 'name').populate('assignedTo', 'name').populate('suggestedManager', 'name').lean(),
     Appointment.countDocuments(filter),
   ]);
   res.json({ items, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
@@ -111,38 +150,66 @@ router.get('/appointments', ah(async (req, res) => {
 
 router.get('/appointments/:id', ah(async (req, res) => {
   const a = await Appointment.findById(req.params.id)
-    .populate('assignedTo', 'name phone email').populate('suggestedManager', 'name');
+    .populate('assignedCrm', 'name phone email')
+    .populate('assignedTo', 'name phone email')
+    .populate('inspectionAssignedBy', 'name')
+    .populate('suggestedManager', 'name');
   if (!a) return res.status(404).json({ message: 'Appointment not found' });
   res.json(a);
 }));
 
-router.patch('/appointments/:id/assign', ah(async (req, res) => {
-  const { managerId } = req.body;
+// Team lead assigns a new lead to a CRM
+router.patch('/appointments/:id/assign-crm', ah(async (req, res) => {
   const a = await Appointment.findById(req.params.id);
   if (!a) return res.status(404).json({ message: 'Appointment not found' });
-  if (['cancelled', 'completed'].includes(a.status)) return res.status(409).json({ message: `Cannot assign a ${a.status} appointment` });
+  if (!['new', 'crm_assigned'].includes(a.status)) {
+    return res.status(409).json({ message: 'CRM can only be assigned before the lead is verified' });
+  }
+  const crm = await User.findOne({ _id: req.body.crmId, role: 'crm', active: true });
+  if (!crm) return res.status(400).json({ message: 'Choose an active CRM' });
 
-  const m = await User.findOne({ _id: managerId, role: 'manager', active: true });
-  if (!m) return res.status(400).json({ message: 'Choose an active manager' });
+  const reassign = a.assignedCrm && String(a.assignedCrm) !== String(crm._id);
+  a.assignedCrm = crm._id;
+  a.status = 'crm_assigned';
+  pushHistory(a, reassign ? 'CRM reassigned' : 'CRM assigned', req.user, `Assigned to ${crm.name}`);
+  await a.save();
+  res.json(a);
+}));
+
+// Team lead can also assign a field inspector directly (overrides the project manager)
+router.patch('/appointments/:id/assign', ah(async (req, res) => {
+  const a = await Appointment.findById(req.params.id);
+  if (!a) return res.status(404).json({ message: 'Appointment not found' });
+  if (['new', 'crm_assigned', 'invalid', 'cancelled', 'completed'].includes(a.status)) {
+    return res.status(409).json({ message: 'The lead must be verified by CRM before an inspector is assigned' });
+  }
+  const m = await User.findOne({ _id: req.body.managerId, role: 'manager', active: true });
+  if (!m) return res.status(400).json({ message: 'Choose an active field inspector' });
 
   const reassign = a.assignedTo && String(a.assignedTo) !== String(m._id);
   a.assignedTo = m._id;
-  if (a.status === 'new') a.status = 'assigned';
-  pushHistory(a, reassign ? 'Reassigned' : 'Assigned', req.user, `Assigned to ${m.name}`);
+  a.inspectionAssignedBy = req.user._id;
+  if (a.status === 'awaiting_inspection') a.status = 'assigned';
+  pushHistory(a, reassign ? 'Inspector reassigned' : 'Inspector assigned', req.user, `Assigned to ${m.name}`);
   await a.save();
-  await a.populate('assignedTo', 'name phone email');
   res.json(a);
 }));
 
 router.patch('/appointments/:id/status', ah(async (req, res) => {
   const { status, note } = req.body;
-  const allowed = ['new', 'cancelled', 'completed'];
-  if (!allowed.includes(status)) return res.status(400).json({ message: 'Status can only be set to new, cancelled or completed here' });
+  if (!['new', 'cancelled', 'completed'].includes(status)) {
+    return res.status(400).json({ message: 'Status can only be set to new, cancelled or completed here' });
+  }
   const a = await Appointment.findById(req.params.id);
   if (!a) return res.status(404).json({ message: 'Appointment not found' });
-  if (status === 'new') a.assignedTo = null;
+  if (status === 'new') {
+    // Reopen from the start of the pipeline
+    a.assignedCrm = null;
+    a.assignedTo = null;
+    a.crmVerification = { result: null, note: '' };
+  }
   a.status = status;
-  pushHistory(a, `Marked ${status}`, req.user, note || '');
+  pushHistory(a, status === 'new' ? 'Reopened' : `Marked ${status}`, req.user, note || '');
   await a.save();
   res.json(a);
 }));
@@ -155,26 +222,45 @@ router.delete('/appointments/:id', ah(async (req, res) => {
 
 /* ---------- Rate card & settings ---------- */
 router.get('/rates', ah(async (req, res) => {
-  const [rates, settings] = await Promise.all([RateCard.find().sort({ surfaceType: 1, tier: 1 }), Settings.getGlobal()]);
+  const [rates, settings] = await Promise.all([RateCard.find().sort({ category: 1, tier: 1 }), Settings.getGlobal()]);
   res.json({ rates, settings });
 }));
 
-router.put('/rates/:id', ah(async (req, res) => {
-  const fields = ['productName', 'paintCoverage', 'paintPrice', 'defaultCoats', 'primerName', 'primerCoverage',
-    'primerPrice', 'puttyName', 'puttyCoverage', 'puttyPrice', 'labourRate'];
-  const update = Object.fromEntries(fields.filter((f) => req.body[f] !== undefined).map((f) => [f, req.body[f]]));
-  const r = await RateCard.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
-  if (!r) return res.status(404).json({ message: 'Rate not found' });
-  res.json(r);
+// Save one category's rates in one go: { rates: [{ tier, rate, productName }] }
+router.put('/rates/:category', ah(async (req, res) => {
+  const cat = byKey(req.params.category);
+  if (!cat) return res.status(404).json({ message: 'Unknown category' });
+  const allowed = cat.tiered ? TIERS : ['flat'];
+  for (const r of req.body.rates || []) {
+    if (!allowed.includes(r.tier)) continue;
+    const rate = Number(r.rate);
+    if (!(rate >= 0)) return res.status(400).json({ message: `Enter a valid rate for ${cat.label}` });
+    await RateCard.findOneAndUpdate(
+      { category: cat.key, tier: r.tier },
+      { rate, productName: String(r.productName || '').slice(0, 80) },
+      { upsert: true, new: true, runValidators: true }
+    );
+  }
+  res.json(await RateCard.find({ category: cat.key }));
 }));
 
+// { gstRate, packages: [{ key, label, interior, exterior }] }
 router.put('/settings', ah(async (req, res) => {
   const s = await Settings.getGlobal();
-  const { gstRate, crackRepairRate, scrapingRate, dampTreatment } = req.body;
-  if (gstRate !== undefined) s.gstRate = gstRate;
-  if (crackRepairRate !== undefined) s.crackRepairRate = crackRepairRate;
-  if (scrapingRate !== undefined) s.scrapingRate = scrapingRate;
-  if (dampTreatment) Object.assign(s.dampTreatment, dampTreatment);
+  const { gstRate, packages } = req.body;
+  if (gstRate !== undefined) {
+    if (!(Number(gstRate) >= 0)) return res.status(400).json({ message: 'Enter a valid GST %' });
+    s.gstRate = Number(gstRate);
+  }
+  if (Array.isArray(packages)) {
+    if (packages.length < 1 || packages.length > 5) return res.status(400).json({ message: 'Keep between 1 and 5 options' });
+    s.packages = packages.map((p, i) => ({
+      key: String(p.key || `option${i + 1}`).toLowerCase().replace(/[^a-z0-9_]/g, '') || `option${i + 1}`,
+      label: String(p.label || `Option ${i + 1}`).slice(0, 40),
+      interior: TIERS.includes(p.interior) ? p.interior : 'premium',
+      exterior: TIERS.includes(p.exterior) ? p.exterior : 'premium',
+    }));
+  }
   await s.save();
   res.json(s);
 }));

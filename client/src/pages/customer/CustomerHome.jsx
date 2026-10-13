@@ -8,11 +8,14 @@ import StatusBadge from '../../components/StatusBadge';
 import { fmtDate, inr } from '../../constants';
 
 const nextStep = (a) => ({
-  new: 'We are assigning a manager for your area.',
-  assigned: `${a.manager?.name || 'Your manager'} will call you to fix a visit time.`,
+    new: 'We have received your booking.',
+  crm_assigned: 'Our team will call you shortly to confirm your details.',
+  awaiting_inspection: 'Details confirmed. We are assigning an inspector for your area.',
+  invalid: 'This booking was closed. Call us or book again if you still need a visit.',
+  assigned: `${a.manager?.name || 'Your inspector'} will call you to fix a visit time.`,
   scheduled: `Site visit on ${fmtDate(a.scheduledAt, true)}.`,
   visited: 'Your manager is preparing the estimate.',
-  estimate_sent: 'Your estimate is ready. Review and approve it.',
+  estimate_sent: 'Your estimate is ready. Choose one of the three options.',
   revision_requested: 'We are updating the estimate with your changes.',
   approved: 'Estimate approved. Your manager will schedule the work.',
   completed: 'Work completed. Thank you for choosing Kerala Paints.',
@@ -54,7 +57,7 @@ export default function CustomerHome() {
             </div>
             {a.estimate?.total > 0 && (
               <div className="booking-card__total">
-                <span>Estimate</span>
+                                <span>{a.estimate.selectedOption ? 'Approved' : 'From'}</span>
                 <strong>{inr(Math.round(a.estimate.total))}</strong>
               </div>
             )}

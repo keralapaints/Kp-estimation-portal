@@ -1,49 +1,48 @@
 import { useEffect, useState } from 'react';
 import api, { errMsg } from '../../api';
-import { SURFACE_TYPES, tierLabel } from '../../constants';
+import { CATEGORIES, TIER_LABEL } from '../../constants';
 
-const NUM_FIELDS = [
-  ['paintCoverage', 'Paint coverage (sq ft/L/coat)'], ['paintPrice', 'Paint ₹/L'], ['defaultCoats', 'Coats'],
-  ['primerCoverage', 'Primer coverage (sq ft/L)'], ['primerPrice', 'Primer ₹/L'],
-  ['puttyCoverage', 'Putty coverage (sq ft/kg)'], ['puttyPrice', 'Putty ₹/kg'], ['labourRate', 'Labour ₹/sq ft'],
-];
+const RANGES = ['economy', 'premium', 'luxury'];
 
 export default function RateCard() {
-  const [rates, setRates] = useState([]);
+  const [rates, setRates] = useState({}); // { 'interior:economy': { rate, productName } }
   const [settings, setSettings] = useState(null);
   const [msg, setMsg] = useState({ type: '', text: '' });
-  const [savingId, setSavingId] = useState('');
+  const [saving, setSaving] = useState('');
 
   useEffect(() => {
-    api.get('/admin/rates').then((r) => { setRates(r.data.rates); setSettings(r.data.settings); })
-      .catch((e) => setMsg({ type: 'error', text: errMsg(e) }));
+    api.get('/admin/rates').then((r) => {
+      setRates(Object.fromEntries(r.data.rates.map((x) => [`${x.category}:${x.tier}`, { rate: x.rate, productName: x.productName || '' }])));
+      setSettings(r.data.settings);
+    }).catch((e) => setMsg({ type: 'error', text: errMsg(e) }));
   }, []);
 
-  const edit = (id, k, v) => setRates(rates.map((r) => (r._id === id ? { ...r, [k]: v } : r)));
+  const cell = (cat, tier) => rates[`${cat}:${tier}`] || { rate: '', productName: '' };
+  const setCell = (cat, tier, patch) => setRates((r) => ({ ...r, [`${cat}:${tier}`]: { ...cell(cat, tier), ...patch } }));
 
-  const saveRate = async (r) => {
-    setSavingId(r._id);
+  const saveCategory = async (c) => {
+    setSaving(c.key); setMsg({ type: '', text: '' });
     try {
-      const payload = { ...r };
-      NUM_FIELDS.forEach(([k]) => { payload[k] = Number(r[k]) || 0; });
-      await api.put(`/admin/rates/${r._id}`, payload);
-      setMsg({ type: 'ok', text: `${r.productName} saved` });
+      const tiers = c.tiered ? RANGES : ['flat'];
+      await api.put(`/admin/rates/${c.key}`, { rates: tiers.map((t) => ({ tier: t, ...cell(c.key, t) })) });
+      setMsg({ type: 'ok', text: `${c.label} rates saved` });
     } catch (e) {
       setMsg({ type: 'error', text: errMsg(e) });
-    } finally {
-      setSavingId('');
-    }
+    } finally { setSaving(''); }
   };
+
+  const setPkg = (i, patch) => setSettings((s) => ({ ...s, packages: s.packages.map((p, j) => (j === i ? { ...p, ...patch } : p)) }));
 
   const saveSettings = async (e) => {
     e.preventDefault();
+    setSaving('settings'); setMsg({ type: '', text: '' });
     try {
-      const { data } = await api.put('/admin/settings', settings);
+      const { data } = await api.put('/admin/settings', { gstRate: settings.gstRate, packages: settings.packages });
       setSettings(data);
-      setMsg({ type: 'ok', text: 'Tax and preparation rates saved' });
+      setMsg({ type: 'ok', text: 'Options and GST saved' });
     } catch (err) {
       setMsg({ type: 'error', text: errMsg(err) });
-    }
+    } finally { setSaving(''); }
   };
 
   if (!settings) return msg.text ? <p className="alert alert--error">{msg.text}</p> : <div className="page-loading">Loading…</div>;
@@ -51,51 +50,61 @@ export default function RateCard() {
   return (
     <>
       <div className="page-head">
-        <div><h1>Rate card</h1><p className="muted">Estimates use these prices. Changes apply to estimates generated after you save.</p></div>
+        <div><h1>Rate card</h1><p className="muted">All-inclusive rates in ₹ per sq ft (material and labour, before GST). Changes apply to estimates generated after you save.</p></div>
       </div>
       {msg.text && <p className={`alert alert--${msg.type === 'ok' ? 'ok' : 'error'}`}>{msg.text}</p>}
 
       <form className="panel" onSubmit={saveSettings}>
-        <h2>Tax and surface preparation</h2>
-        <div className="grid grid--6">
-          <label className="field"><span>GST %</span><input type="number" step="0.01" value={settings.gstRate} onChange={(e) => setSettings({ ...settings, gstRate: e.target.value })} /></label>
-          <label className="field"><span>Crack repair ₹/sq ft</span><input type="number" step="0.01" value={settings.crackRepairRate} onChange={(e) => setSettings({ ...settings, crackRepairRate: e.target.value })} /></label>
-          <label className="field"><span>Scraping ₹/sq ft</span><input type="number" step="0.01" value={settings.scrapingRate} onChange={(e) => setSettings({ ...settings, scrapingRate: e.target.value })} /></label>
-          {['low', 'medium', 'high'].map((lvl) => (
-            <label key={lvl} className="field"><span>Damp ({lvl}) ₹/sq ft</span>
-              <input type="number" step="0.01" value={settings.dampTreatment[lvl]}
-                onChange={(e) => setSettings({ ...settings, dampTreatment: { ...settings.dampTreatment, [lvl]: e.target.value } })} />
-            </label>
+        <h2>The three options shown to the customer</h2>
+        <p className="muted">Shown in this order. Each option picks a range for interior work (interior painting, texture, polish &amp; enamel) and for exterior work (exterior painting, waterproofing, heat reduction). Putty and dampness use one standard rate.</p>
+        <div className="pkg-table">
+          <div className="pkg-row pkg-row--head"><span>#</span><span>Name</span><span>Interior range</span><span>Exterior range</span></div>
+          {settings.packages.map((p, i) => (
+            <div key={i} className="pkg-row">
+              <span className="pkg-n">{i + 1}</span>
+              <input value={p.label} aria-label={`Option ${i + 1} name`} onChange={(e) => setPkg(i, { label: e.target.value })} />
+              <select value={p.interior} aria-label={`Option ${i + 1} interior range`} onChange={(e) => setPkg(i, { interior: e.target.value })}>
+                {RANGES.map((t) => <option key={t} value={t}>{TIER_LABEL[t]}</option>)}
+              </select>
+              <select value={p.exterior} aria-label={`Option ${i + 1} exterior range`} onChange={(e) => setPkg(i, { exterior: e.target.value })}>
+                {RANGES.map((t) => <option key={t} value={t}>{TIER_LABEL[t]}</option>)}
+              </select>
+            </div>
           ))}
         </div>
-        <button className="btn btn--primary">Save rates</button>
+        <div className="inline-form">
+          <label className="field"><span>GST %</span>
+            <input type="number" step="0.01" min="0" value={settings.gstRate} onChange={(e) => setSettings({ ...settings, gstRate: e.target.value })} />
+          </label>
+          <button className="btn btn--primary" disabled={saving === 'settings'}>{saving === 'settings' ? 'Saving…' : 'Save options and GST'}</button>
+        </div>
       </form>
 
-      {SURFACE_TYPES.map((st) => (
-        <section key={st.value} className="panel">
-          <h2>{st.label}</h2>
-          <div className="rate-rows">
-            {rates.filter((r) => r.surfaceType === st.value).map((r) => (
-              <div key={r._id} className="rate-row">
-                <div className="rate-row__head">
-                  <span className={`tier tier--${r.tier}`}>{tierLabel(r.tier)}</span>
-                  <input className="rate-row__name" aria-label="Product name" value={r.productName} onChange={(e) => edit(r._id, 'productName', e.target.value)} />
-                  <button className="btn btn--small btn--outline" disabled={savingId === r._id} onClick={() => saveRate(r)}>
-                    {savingId === r._id ? 'Saving…' : 'Save'}
-                  </button>
+      <div className="rate-cards">
+        {CATEGORIES.map((c) => (
+          <section key={c.key} className="panel rate-card">
+            <div className="panel__head">
+              <h2>{c.label}</h2>
+              <button className="btn btn--small btn--outline" disabled={saving === c.key} onClick={() => saveCategory(c)}>
+                {saving === c.key ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+            <div className={`rate-grid ${c.tiered ? '' : 'rate-grid--flat'}`}>
+              {(c.tiered ? RANGES : ['flat']).map((t) => (
+                <div key={t} className="rate-tier">
+                  <span className={`tier tier--${t}`}>{TIER_LABEL[t]}</span>
+                  <label className="field field--tight"><span>Product</span>
+                    <input value={cell(c.key, t).productName} onChange={(e) => setCell(c.key, t, { productName: e.target.value })} />
+                  </label>
+                  <label className="field field--tight"><span>₹ per sq ft</span>
+                    <input type="number" step="0.01" min="0" value={cell(c.key, t).rate} onChange={(e) => setCell(c.key, t, { rate: e.target.value })} />
+                  </label>
                 </div>
-                <div className="grid grid--8">
-                  {NUM_FIELDS.map(([k, label]) => (
-                    <label key={k} className="field field--tight"><span>{label}</span>
-                      <input type="number" step="0.01" min="0" value={r[k]} onChange={(e) => edit(r._id, k, e.target.value)} />
-                    </label>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      ))}
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
     </>
   );
 }

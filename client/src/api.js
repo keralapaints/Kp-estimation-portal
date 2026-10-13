@@ -1,8 +1,9 @@
 import axios from 'axios';
 
-const api = axios.create({
-  baseURL: `${(import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '')}/api`,
-});
+export const API_ROOT = `${(import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '')}/api`;
+export const photoUrl = (id) => `${API_ROOT}/photos/${id}`;
+
+const api = axios.create({ baseURL: API_ROOT });
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('kp_token');

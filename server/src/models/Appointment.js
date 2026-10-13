@@ -1,83 +1,110 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
-const SURFACE_TYPES = ['interior', 'exterior', 'waterproofing', 'wood', 'metal'];
 const TIERS = ['economy', 'premium', 'luxury'];
+const DISTRICTS = ['Thiruvananthapuram', 'Kollam', 'Pathanamthitta', 'Alappuzha', 'Kottayam', 'Idukki', 'Ernakulam',
+  'Thrissur', 'Palakkad', 'Malappuram', 'Kozhikode', 'Wayanad', 'Kannur', 'Kasaragod', 'Others'];
+const URGENCY = ['immediate', 'within_1_month', 'within_6_months'];
 const STATUSES = [
-  'new',                // booked by customer, not yet assigned
-  'assigned',           // super admin assigned a manager
-  'scheduled',          // manager fixed a visit date
-  'visited',            // measurements saved, estimate generated
-  'estimate_sent',      // estimate link shared with the customer
-  'revision_requested', // customer asked for changes
-  'approved',           // customer approved the estimate
-  'completed',          // job finished
+  'new',                 // booked by customer, waiting for team lead to assign a CRM
+  'crm_assigned',        // CRM is calling the customer to verify details
+  'awaiting_inspection', // CRM verified: genuine, waiting for project manager to assign an inspector
+  'invalid',             // CRM marked the lead as wrong / not genuine
+  'assigned',            // field inspector assigned
+  'scheduled',           // inspector fixed a visit date
+  'visited',             // measurements saved, estimate generated
+  'estimate_sent',       // estimate link shared with the customer
+  'revision_requested',  // customer asked for changes
+  'approved',            // customer approved the estimate
+  'completed',           // job finished
   'cancelled',
 ];
 
-const surfaceSchema = new Schema({
-  surfaceType: { type: String, enum: SURFACE_TYPES, required: true },
-  label: { type: String, trim: true, default: '' },
-  length: Number,
-  height: Number,
-  area: { type: Number, required: true, min: 0 }, // sq ft
-  condition: {
-    dampness: { type: String, enum: ['none', 'low', 'medium', 'high'], default: 'none' },
-    cracks: { type: Boolean, default: false },
-    flaking: { type: Boolean, default: false },
-  },
-  tier: { type: String, enum: TIERS, default: 'premium' },
-  coats: { type: Number, default: 2, min: 1, max: 5 },
-});
+// ---- Site measurements: category -> areas (rooms) -> surfaces (wall, ceiling...) ----
+const deductionSchema = new Schema({
+  label: { type: String, default: 'Door' }, // Door, Window, Ventilator...
+  length: { type: Number, default: 0 },
+  height: { type: Number, default: 0 },
+  qty: { type: Number, default: 1 },
+}, { _id: false });
 
-const lineItemSchema = new Schema(
-  {
-    surfaceLabel: String,
-    category: { type: String, enum: ['material', 'prep', 'labour'] },
-    description: String,
-    qty: Number,
-    unit: String,
-    rate: Number,
-    amount: Number,
-  },
-  { _id: false }
-);
+const surfaceSchema = new Schema({
+  type: { type: String, default: 'Wall' },  // Wall, Ceiling, Roof / Terrace...
+  length: { type: Number, default: 0 },
+  height: { type: Number, default: 0 },
+  deductions: [deductionSchema],
+  sqft: { type: Number, default: 0 },       // effective sq ft, calculated on the server
+  colorCode: { type: String, default: '' },
+  photos: [{ type: Schema.Types.ObjectId, ref: 'Photo' }],
+}, { _id: false });
+
+const areaSchema = new Schema({
+  room: { type: String, default: '' },      // Hall, Kitchen, Front elevation...
+  name: { type: String, default: '' },      // optional label, e.g. "Bedroom 2"
+  surfaces: [surfaceSchema],
+  sqft: { type: Number, default: 0 },
+}, { _id: false });
+
+const sectionSchema = new Schema({
+  category: { type: String, required: true },
+  areas: [areaSchema],
+  sqft: { type: Number, default: 0 },
+}, { _id: false });
+
+// ---- Estimate: total sq ft per category, priced as three options ----
+const optionLineSchema = new Schema({
+  category: String, label: String, sqft: Number, tier: String, rate: Number, amount: Number,
+}, { _id: false });
+
+const optionSchema = new Schema({
+  key: String, label: String, interior: String, exterior: String,
+  lines: [optionLineSchema], subtotal: Number, gstRate: Number, gst: Number, total: Number,
+}, { _id: false });
 
 const appointmentSchema = new Schema(
   {
     refNo: { type: String, unique: true },
     customer: {
       name: { type: String, required: true, trim: true },
-      email: { type: String, required: true, lowercase: true, trim: true },
+      email: { type: String, lowercase: true, trim: true, default: '' },
       mobile: { type: String, required: true, trim: true },
-      pincode: { type: String, required: true, trim: true },
-      address: { type: String, trim: true, default: '' },
+      district: { type: String, enum: [...DISTRICTS, ''], default: '' },
+      pincode: { type: String, trim: true, default: '' },
+      address: { type: String, trim: true, default: '' }, // filled in by CRM on the verification call
     },
+    urgency: { type: String, enum: [...URGENCY, ''], default: '' },
     whatsappOptIn: { type: Boolean, default: true },
     preferredDate: Date,
     preferredSlot: { type: String, default: '' },
 
     status: { type: String, enum: STATUSES, default: 'new', index: true },
+    // CRM stage
+    assignedCrm: { type: Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+    crmVerification: {
+      result: { type: String, enum: ['waiting_inspection', 'wrong', null], default: null },
+      note: { type: String, default: '' },
+      at: Date,
+      by: { type: Schema.Types.ObjectId, ref: 'User' },
+    },
+    // Inspection stage (assignedTo = field inspector, the 'manager' role)
     assignedTo: { type: Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+    inspectionAssignedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     suggestedManager: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     scheduledAt: Date,
 
     siteVisit: {
-      surfaces: [surfaceSchema],
+      categories: [String],
+      sections: [sectionSchema],
       notes: { type: String, default: '' },
       visitedAt: Date,
     },
 
     estimate: {
-      lineItems: [lineItemSchema],
-      totalArea: Number,
-      materialTotal: Number,
-      prepTotal: Number,
-      labourTotal: Number,
-      subtotal: Number,
-      gstRate: Number,
-      gst: Number,
-      total: Number,
+      categories: [{ _id: false, category: String, label: String, sqft: Number }],
+      totalSqft: Number,
+      options: [optionSchema],
+      selectedOption: { type: String, default: null }, // set when the customer approves
+      total: Number,       // selected option total, or the lowest option until approved
       version: { type: Number, default: 0 },
       generatedAt: Date,
       sentAt: Date,
@@ -87,6 +114,7 @@ const appointmentSchema = new Schema(
     customerResponse: {
       action: { type: String, enum: ['approve', 'revise', null], default: null },
       comment: String,
+      option: String,      // option key the customer approved
       requestedTier: String,
       at: Date,
     },
@@ -112,6 +140,7 @@ appointmentSchema.pre('validate', function () {
 });
 
 module.exports = mongoose.model('Appointment', appointmentSchema);
-module.exports.SURFACE_TYPES = SURFACE_TYPES;
 module.exports.TIERS = TIERS;
 module.exports.STATUSES = STATUSES;
+module.exports.DISTRICTS = DISTRICTS;
+module.exports.URGENCY = URGENCY;

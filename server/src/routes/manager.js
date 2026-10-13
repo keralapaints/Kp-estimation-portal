@@ -5,8 +5,9 @@ const RateCard = require('../models/RateCard');
 const Settings = require('../models/Settings');
 const { protect, allow } = require('../middleware/auth');
 const { ah, pushHistory, clientUrl } = require('../utils/helpers');
-const { computeEstimate } = require('../utils/estimate');
+const { normalizeSiteVisit, computeEstimate } = require('../utils/estimate');
 
+// 'manager' = field inspector
 router.use(protect, allow('manager'));
 
 const findMine = async (req) => {
@@ -19,34 +20,23 @@ const findMine = async (req) => {
   return a;
 };
 
-const cleanSurfaces = (surfaces = []) =>
-  surfaces.map((s) => ({
-    surfaceType: s.surfaceType,
-    label: s.label || '',
-    length: s.length ? Number(s.length) : undefined,
-    height: s.height ? Number(s.height) : undefined,
-    area: Number(s.area),
-    tier: s.tier || 'premium',
-    coats: Number(s.coats) || 2,
-    condition: {
-      dampness: s.condition?.dampness || 'none',
-      cracks: !!s.condition?.cracks,
-      flaking: !!s.condition?.flaking,
-    },
-  }));
+const rs = (n) => Number(n).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
 const estimateLinks = (a) => {
   // Opens the customer portal and logs the customer in automatically
   const shareUrl = `${clientUrl()}/my/open/${a.publicToken}`;
-  const total = Number(a.estimate.total).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+  const opts = a.estimate.options || [];
   const text = [
     `Hello ${a.customer.name},`,
     '',
     `Your Kerala Paints painting estimate is ready.`,
     `Booking ref: ${a.refNo}`,
-    `Total: Rs ${total} (incl. GST)`,
+    `Total area: ${a.estimate.totalSqft} sq ft`,
     '',
-    `View the full breakdown and approve or request changes here:`,
+    ...opts.map((o) => `${o.label}: Rs ${rs(o.total)}`),
+    '(all prices incl. GST)',
+    '',
+    `See the full breakdown and choose your option here:`,
     shareUrl,
     '',
     `You can also log in any time at ${clientUrl()}/my with your mobile number and booking ref.`,
@@ -57,14 +47,15 @@ const estimateLinks = (a) => {
 router.get('/appointments', ah(async (req, res) => {
   const filter = { assignedTo: req.user._id };
   if (req.query.status) filter.status = { $in: String(req.query.status).split(',') };
-  const items = await Appointment.find(filter).sort({ updatedAt: -1 }).select('-history -estimate.lineItems').lean();
+  const items = await Appointment.find(filter).sort({ updatedAt: -1 })
+    .select('-history -siteVisit -estimate.options').lean();
   res.json(items);
 }));
 
 router.get('/appointments/:id', ah(async (req, res) => {
   const a = await findMine(req);
   const out = a.toObject();
-  if (a.publicToken && a.estimate?.total) Object.assign(out, estimateLinks(a));
+  if (a.publicToken && a.estimate?.options?.length) Object.assign(out, estimateLinks(a));
   res.json(out);
 }));
 
@@ -80,39 +71,37 @@ router.patch('/appointments/:id/schedule', ah(async (req, res) => {
   res.json(a);
 }));
 
-// Live preview while the manager types - nothing is saved
+// Live preview while the inspector types - nothing is saved
 router.post('/appointments/:id/preview-estimate', ah(async (req, res) => {
   await findMine(req);
   const [rates, settings] = await Promise.all([RateCard.find(), Settings.getGlobal()]);
-  res.json(computeEstimate(cleanSurfaces(req.body.surfaces), rates, settings));
+  const visit = normalizeSiteVisit(req.body);
+  res.json({ siteVisit: visit, estimate: computeEstimate(visit, rates, settings) });
 }));
 
-// Save measurements and generate the estimate
+// Save measurements and generate the three-option estimate
 router.put('/appointments/:id/site-visit', ah(async (req, res) => {
   const a = await findMine(req);
   if (['approved', 'completed', 'cancelled'].includes(a.status)) {
     return res.status(409).json({ message: `This appointment is ${a.status}; measurements are locked` });
   }
-  const surfaces = cleanSurfaces(req.body.surfaces);
   const [rates, settings] = await Promise.all([RateCard.find(), Settings.getGlobal()]);
-  const est = computeEstimate(surfaces, rates, settings);
+  const visit = normalizeSiteVisit(req.body);
+  const est = computeEstimate(visit, rates, settings);
 
-  a.siteVisit.surfaces = surfaces;
-  a.siteVisit.notes = req.body.notes || '';
-  if (!a.siteVisit.visitedAt) a.siteVisit.visitedAt = new Date();
+  a.siteVisit = { ...visit, visitedAt: a.siteVisit?.visitedAt || new Date() };
   a.estimate = { ...est, version: (a.estimate?.version || 0) + 1, generatedAt: new Date() };
   if (!a.publicToken) a.publicToken = crypto.randomBytes(16).toString('hex');
   a.status = 'visited';
   pushHistory(a, `Estimate v${a.estimate.version} generated`, req.user,
-    `${surfaces.length} surface(s), ${est.totalArea} sq ft, total Rs ${est.total}`);
+    `${est.categories.map((c) => `${c.label} ${c.sqft} sq ft`).join(', ')}. ${est.options.map((o) => `${o.label} Rs ${rs(o.total)}`).join(', ')}`);
   await a.save();
   res.json({ ...a.toObject(), ...estimateLinks(a) });
 }));
 
-// Mark the estimate as shared with the customer; returns the WhatsApp link
 router.patch('/appointments/:id/send-estimate', ah(async (req, res) => {
   const a = await findMine(req);
-  if (!a.estimate?.total) return res.status(400).json({ message: 'Generate the estimate first' });
+  if (!a.estimate?.options?.length) return res.status(400).json({ message: 'Generate the estimate first' });
   if (!['visited', 'estimate_sent', 'revision_requested'].includes(a.status)) {
     return res.status(409).json({ message: `Cannot send an estimate while the appointment is ${a.status}` });
   }

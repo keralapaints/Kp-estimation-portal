@@ -8,6 +8,8 @@ app.set('trust proxy', 1); // Render sits behind a proxy (needed for rate limiti
 
 const origins = (process.env.CLIENT_URL || 'http://localhost:5173').split(',').map((s) => s.trim());
 app.use(cors({ origin: origins }));
+// Photo uploads need a bigger body limit, so they are mounted before the normal JSON parser
+app.use('/api/photos', express.json({ limit: '6mb' }), require('./routes/photos'));
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
@@ -16,6 +18,9 @@ app.use('/api/public', require('./routes/public'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/manager', require('./routes/manager'));
 app.use('/api/customer', require('./routes/customer')); 
+app.use('/api/manager', require('./routes/manager'));
+app.use('/api/crm', require('./routes/crm'));   // ← add
+app.use('/api/pm', require('./routes/pm'));     // ← add
 
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 

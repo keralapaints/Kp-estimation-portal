@@ -18,7 +18,7 @@ const forCustomer = (a) => ({
   preferredSlot: a.preferredSlot,
   scheduledAt: a.scheduledAt,
   manager: a.assignedTo ? { name: a.assignedTo.name, phone: a.assignedTo.phone } : null,
-  surfaces: a.siteVisit?.surfaces || [],
+  siteVisit: { categories: a.siteVisit?.categories || [], sections: a.siteVisit?.sections || [] },
   visitedAt: a.siteVisit?.visitedAt,
   // Only show the estimate once it has been sent to the customer
   estimate: ['estimate_sent', 'revision_requested', 'approved', 'completed'].includes(a.status) ? a.estimate : null,
@@ -69,10 +69,11 @@ router.get('/appointments/:id', ah(async (req, res) => {
   res.json(forCustomer(a));
 }));
 
+// Customer approves one of the three options, or asks for changes
 router.post('/appointments/:id/respond', ah(async (req, res) => {
-  const { action, comment, requestedTier } = req.body;
-  if (!['approve', 'revise'].includes(action)) return res.status(400).json({ message: 'Choose approve or request changes' });
-  if (action === 'revise' && !comment?.trim() && !requestedTier) {
+  const { action, option, comment } = req.body;
+  if (!['approve', 'revise'].includes(action)) return res.status(400).json({ message: 'Choose an option or request changes' });
+  if (action === 'revise' && !String(comment || '').trim()) {
     return res.status(400).json({ message: 'Tell us what you would like changed' });
   }
 
@@ -83,10 +84,18 @@ router.post('/appointments/:id/respond', ah(async (req, res) => {
     return res.status(409).json({ message: 'This estimate has already been answered or is being updated' });
   }
 
-  a.customerResponse = { action, comment: comment || '', requestedTier: requestedTier || '', at: new Date() };
+  let chosen = null;
+  if (action === 'approve') {
+    chosen = (a.estimate.options || []).find((o) => o.key === option);
+    if (!chosen) return res.status(400).json({ message: 'Choose one of the options' });
+    a.estimate.selectedOption = chosen.key;
+    a.estimate.total = chosen.total;
+  }
+
+  a.customerResponse = { action, option: chosen?.key || '', comment: comment || '', at: new Date() };
   a.status = action === 'approve' ? 'approved' : 'revision_requested';
-  pushHistory(a, action === 'approve' ? 'Customer approved estimate' : 'Customer requested changes', null,
-    [requestedTier && `Wants ${requestedTier} range`, comment].filter(Boolean).join(' - '));
+  pushHistory(a, action === 'approve' ? `Customer approved the ${chosen.label} option` : 'Customer requested changes', null,
+    action === 'approve' ? `Rs ${Math.round(chosen.total).toLocaleString('en-IN')} incl. GST` : comment);
   await a.save();
   res.json(forCustomer(a));
 }));

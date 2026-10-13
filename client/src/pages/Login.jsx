@@ -3,6 +3,7 @@ import { Navigate, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { errMsg } from '../api';
 import Brand from '../components/Brand';
+import { homeFor } from '../constants';
 
 export default function Login() {
   const { user, login } = useAuth();
@@ -10,14 +11,14 @@ export default function Login() {
   const [form, setForm] = useState({ email: '', password: '' });
   const [state, setState] = useState({ loading: false, error: '' });
 
-  if (user) return <Navigate to={user.role === 'superadmin' ? '/admin' : '/manager'} replace />;
+if (user) return <Navigate to={homeFor(user.role)} replace />;
 
   const submit = async (e) => {
     e.preventDefault();
     setState({ loading: true, error: '' });
     try {
       const u = await login(form.email, form.password);
-      navigate(u.role === 'superadmin' ? '/admin' : '/manager');
+      navigate(homeFor(u.role));
     } catch (err) {
       setState({ loading: false, error: errMsg(err) });
     }

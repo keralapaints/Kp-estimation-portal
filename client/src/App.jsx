@@ -7,10 +7,13 @@ import DashboardLayout from './components/DashboardLayout';
 import AdminDashboard from './pages/admin/Dashboard';
 import AdminAppointments from './pages/admin/Appointments';
 import AdminAppointmentDetail from './pages/admin/AppointmentDetail';
-import Managers from './pages/admin/Managers';
+import Team from './pages/admin/Team';
 import RateCard from './pages/admin/RateCard';
 import MyAppointments from './pages/manager/MyAppointments';
 import VisitDetail from './pages/manager/VisitDetail';
+import CrmLeads from './pages/crm/CrmLeads';
+import CrmLeadDetail from './pages/crm/CrmLeadDetail';
+import PmQueue from './pages/pm/PmQueue';
 import { CustomerAuthProvider } from './context/CustomerAuthContext';
 import CustomerLayout from './components/CustomerLayout';
 import CustomerLogin from './pages/customer/CustomerLogin';
@@ -43,8 +46,17 @@ export default function App() {
         <Route index element={<AdminDashboard />} />
         <Route path="appointments" element={<AdminAppointments />} />
         <Route path="appointments/:id" element={<AdminAppointmentDetail />} />
-        <Route path="managers" element={<Managers />} />
+        <Route path="team" element={<Team />} />
         <Route path="rates" element={<RateCard />} />
+      </Route>
+
+      <Route path="/crm" element={<ProtectedRoute role="crm"><DashboardLayout /></ProtectedRoute>}>
+        <Route index element={<CrmLeads />} />
+        <Route path="leads/:id" element={<CrmLeadDetail />} />
+      </Route>
+
+      <Route path="/pm" element={<ProtectedRoute role="project_manager"><DashboardLayout /></ProtectedRoute>}>
+        <Route index element={<PmQueue />} />
       </Route>
 
       <Route path="/manager" element={<ProtectedRoute role="manager"><DashboardLayout /></ProtectedRoute>}>

@@ -2,10 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, Phone, MessageCircle, Copy, ExternalLink } from 'lucide-react';
 import api, { errMsg } from '../../api';
-import { fmtDate, inr } from '../../constants';
+import { fmtDate, areaOf, urgencyLabel } from '../../constants';
 import StatusBadge from '../../components/StatusBadge';
-import SurfaceEditor, { blankSurface } from '../../components/SurfaceEditor';
-import EstimateTable from '../../components/EstimateTable';
+import MeasurementForm, { withKeys, sectionSqft } from '../../components/MeasurementForm';
+import EstimateOptions from '../../components/EstimateOptions';
 import History from '../../components/History';
 
 const toLocalInput = (d) => {
@@ -14,26 +14,35 @@ const toLocalInput = (d) => {
   return new Date(x.getTime() - x.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 };
 
+// What gets sent to the server (React keys removed)
+const toPayload = (v) => ({
+  categories: v.categories,
+  notes: v.notes,
+  sections: v.sections.map((sec) => ({
+    category: sec.category,
+    areas: sec.areas.map(({ key, ...a }) => ({
+      ...a,
+      surfaces: a.surfaces.map(({ key: _k, ...s }) => ({ ...s, deductions: s.deductions.map(({ key: _d, ...d }) => d) })),
+    })),
+  })),
+});
+
 export default function VisitDetail() {
   const { id } = useParams();
   const [a, setA] = useState(null);
   const [error, setError] = useState('');
   const [flash, setFlash] = useState('');
   const [scheduledAt, setScheduledAt] = useState('');
-  const [surfaces, setSurfaces] = useState([blankSurface()]);
-  const [notes, setNotes] = useState('');
+  const [visit, setVisit] = useState({ categories: [], sections: [], notes: '' });
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState('');
   const [busy, setBusy] = useState('');
   const debounce = useRef();
 
-  const hydrate = (data) => {
+  const hydrate = (data, { keepVisit = false } = {}) => {
     setA(data);
     setScheduledAt(toLocalInput(data.scheduledAt || data.preferredDate));
-    if (data.siteVisit?.surfaces?.length) {
-      setSurfaces(data.siteVisit.surfaces.map((s) => ({ ...s, key: s._id, length: s.length ?? '', height: s.height ?? '' })));
-      setNotes(data.siteVisit.notes || '');
-    }
+    if (!keepVisit) setVisit(withKeys(data.siteVisit));
   };
 
   useEffect(() => {
@@ -44,15 +53,14 @@ export default function VisitDetail() {
   useEffect(() => {
     if (!a) return;
     clearTimeout(debounce.current);
-    const ready = surfaces.some((s) => Number(s.area) > 0);
-    if (!ready) { setPreview(null); return; }
+    if (!visit.sections.some((s) => sectionSqft(s) > 0)) { setPreview(null); setPreviewError(''); return; }
     debounce.current = setTimeout(() => {
-      api.post(`/manager/appointments/${id}/preview-estimate`, { surfaces: surfaces.filter((s) => Number(s.area) > 0) })
-        .then((r) => { setPreview(r.data); setPreviewError(''); })
+      api.post(`/manager/appointments/${id}/preview-estimate`, toPayload(visit))
+        .then((r) => { setPreview(r.data.estimate); setPreviewError(''); })
         .catch((e) => setPreviewError(errMsg(e)));
-    }, 500);
+    }, 600);
     return () => clearTimeout(debounce.current);
-  }, [surfaces, a, id]);
+  }, [visit, a, id]);
 
   const run = async (key, fn, ok) => {
     setBusy(key); setError(''); setFlash('');
@@ -61,38 +69,35 @@ export default function VisitDetail() {
 
   const schedule = () => run('schedule', async () => {
     const { data } = await api.patch(`/manager/appointments/${id}/schedule`, { scheduledAt: new Date(scheduledAt).toISOString() });
-    hydrate({ ...a, ...data });
+    hydrate({ ...a, ...data }, { keepVisit: true });
   }, 'Visit scheduled');
 
   const saveVisit = (e) => {
     e.preventDefault();
     run('save', async () => {
-      const { data } = await api.put(`/manager/appointments/${id}/site-visit`, { surfaces, notes });
+      const { data } = await api.put(`/manager/appointments/${id}/site-visit`, toPayload(visit));
       hydrate(data);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }, 'Measurements saved and estimate generated');
   };
 
   const sendEstimate = async () => {
-    // Open the tab synchronously so pop-up blockers allow it
-    const win = window.open('', '_blank');
+    const win = window.open('', '_blank'); // opened now so pop-up blockers allow it
     setBusy('send'); setError(''); setFlash('');
     try {
       const { data } = await api.patch(`/manager/appointments/${id}/send-estimate`);
-      hydrate(data);
-      if (win) win.location.href = data.whatsappUrl;
-      else window.location.href = data.whatsappUrl;
+      hydrate(data, { keepVisit: true });
+      if (win) win.location.href = data.whatsappUrl; else window.location.href = data.whatsappUrl;
       setFlash('Estimate marked as sent');
-    } catch (e) {
+    } catch (err) {
       win?.close();
-      setError(errMsg(e));
-    } finally {
-      setBusy('');
-    }
+      setError(errMsg(err));
+    } finally { setBusy(''); }
   };
 
   const complete = () => run('complete', async () => {
     const { data } = await api.patch(`/manager/appointments/${id}/complete`);
-    hydrate({ ...a, ...data });
+    hydrate({ ...a, ...data }, { keepVisit: true });
   }, 'Job marked completed');
 
   const copyLink = async () => {
@@ -105,7 +110,8 @@ export default function VisitDetail() {
 
   const locked = ['approved', 'completed', 'cancelled'].includes(a.status);
   const canSchedule = ['assigned', 'scheduled'].includes(a.status);
-  const canSend = a.estimate?.total && ['visited', 'estimate_sent', 'revision_requested'].includes(a.status);
+  const canSend = a.estimate?.options?.length && ['visited', 'estimate_sent', 'revision_requested'].includes(a.status);
+  const shown = preview || (a.estimate?.options?.length ? a.estimate : null);
 
   return (
     <>
@@ -117,31 +123,31 @@ export default function VisitDetail() {
 
       {error && <p className="alert alert--error">{error}</p>}
       {flash && <p className="alert alert--ok" role="status">{flash}</p>}
-
       {a.status === 'revision_requested' && (
         <div className="alert alert--warn">
           <strong>Customer asked for changes.</strong>
-          {a.customerResponse?.requestedTier && <> Wants the {a.customerResponse.requestedTier} range.</>}
           {a.customerResponse?.comment && <> “{a.customerResponse.comment}”</>}
-          <br />Update the surfaces below, save, then send the new estimate.
+          <br />Update the measurements below, save, then send the new estimate.
         </div>
       )}
 
-      <div className="split">
+      <div className="split split--wide">
         <div className="stack">
           <section className="panel">
             <h2>Customer</h2>
             <dl className="facts">
               <div><dt>Mobile</dt><dd>{a.customer.mobile}</dd></div>
-              <div><dt>Email</dt><dd>{a.customer.email}</dd></div>
-              <div className="facts__wide"><dt>Address</dt><dd>{a.customer.address || '—'}, {a.customer.pincode}</dd></div>
+              <div><dt>Area</dt><dd>{areaOf(a.customer)}</dd></div>
+              <div className="facts__wide"><dt>Address</dt><dd>{a.customer.address || '—'}</dd></div>
               <div><dt>Prefers</dt><dd>{a.preferredDate ? fmtDate(a.preferredDate) : 'Any day'}, {a.preferredSlot || 'any time'}</dd></div>
+              <div><dt>Wants to paint</dt><dd>{urgencyLabel(a.urgency) || '—'}</dd></div>
             </dl>
+            {a.crmVerification?.note && <p className="note"><strong>CRM note:</strong> {a.crmVerification.note}</p>}
             <div className="btn-row">
               <a className="btn btn--outline" href={`tel:${a.customer.mobile}`}><Phone size={16} /> Call</a>
               <a className="btn btn--outline" href={`https://wa.me/91${a.customer.mobile}`} target="_blank" rel="noreferrer"><MessageCircle size={16} /> WhatsApp</a>
               <a className="btn btn--outline" target="_blank" rel="noreferrer"
-                href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${a.customer.address} ${a.customer.pincode}`)}`}>
+                href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([a.customer.address, a.customer.district, a.customer.pincode].filter(Boolean).join(' '))}`}>
                 Directions
               </a>
             </div>
@@ -159,21 +165,25 @@ export default function VisitDetail() {
                 </button>
               </div>
             ) : (
-              <p>{a.scheduledAt ? `Visited on ${fmtDate(a.siteVisit?.visitedAt || a.scheduledAt, true)}` : 'Visit recorded'}</p>
+              <p>Visited on {fmtDate(a.siteVisit?.visitedAt || a.scheduledAt, true)}</p>
             )}
           </section>
 
           <form className="panel" onSubmit={saveVisit}>
             <h2>2. Record measurements</h2>
-            <p className="muted">Add one entry per room or surface. Enter length and height, or type the area directly.</p>
-            <SurfaceEditor surfaces={surfaces} onChange={setSurfaces} disabled={locked} />
-            <label className="field"><span>Site notes</span>
-              <textarea rows={3} value={notes} disabled={locked} placeholder="Access, furniture, customer preferences…" onChange={(e) => setNotes(e.target.value)} />
-            </label>
-            {!locked && (
-              <button className="btn btn--primary" disabled={busy === 'save'}>
-                {busy === 'save' ? 'Saving…' : a.estimate?.version ? 'Save and regenerate estimate' : 'Save and generate estimate'}
-              </button>
+            <MeasurementForm value={visit} onChange={setVisit} appointmentId={a._id} disabled={locked} />
+            {visit.categories.length > 0 && (
+              <>
+                <label className="field mform__notes"><span>Site notes</span>
+                  <textarea rows={3} value={visit.notes} disabled={locked} placeholder="Access, furniture, customer preferences…"
+                    onChange={(e) => setVisit((v) => ({ ...v, notes: e.target.value }))} />
+                </label>
+                {!locked && (
+                  <button className="btn btn--primary" disabled={busy === 'save'}>
+                    {busy === 'save' ? 'Saving…' : a.estimate?.version ? 'Save and regenerate estimate' : 'Save and generate estimate'}
+                  </button>
+                )}
+              </>
             )}
           </form>
         </div>
@@ -181,11 +191,11 @@ export default function VisitDetail() {
         <div className="stack stack--sticky">
           <section className="panel">
             <div className="panel__head">
-              <h2>{a.estimate?.version ? `3. Estimate v${a.estimate.version}` : '3. Estimate'}</h2>
-              {preview && <span className="muted">Live {inr(preview.total)}</span>}
+              <h2>{a.estimate?.version ? `3. Average estimate (v${a.estimate.version})` : '3. Average estimate'}</h2>
+              {preview && <span className="muted">Live</span>}
             </div>
             {previewError && <p className="alert alert--error">{previewError}</p>}
-            {preview ? <EstimateTable estimate={preview} compact /> : <p className="muted">Enter an area to see the estimate build up.</p>}
+            {shown ? <EstimateOptions estimate={shown} /> : <p className="muted">Enter measurements to see the three options build up.</p>}
 
             {canSend && (
               <div className="send-box">
@@ -201,7 +211,7 @@ export default function VisitDetail() {
             )}
             {a.status === 'approved' && (
               <div className="send-box">
-                <p className="alert alert--ok">Customer approved this estimate.</p>
+                <p className="alert alert--ok">Customer chose the <strong>{a.estimate.options.find((o) => o.key === a.estimate.selectedOption)?.label}</strong> option.</p>
                 <button className="btn btn--primary btn--block" onClick={complete} disabled={busy === 'complete'}>Mark job completed</button>
               </div>
             )}

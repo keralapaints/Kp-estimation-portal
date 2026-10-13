@@ -7,7 +7,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     phone: { type: String, trim: true, default: '' },
     password: { type: String, required: true, minlength: 6, select: false },
-    role: { type: String, enum: ['superadmin', 'manager'], default: 'manager' },
+    role: { type: String, enum: ['superadmin', 'crm', 'project_manager', 'manager'], default: 'manager' }, // manager = field inspector
     region: { type: String, trim: true, default: '' },
     // Pincodes this manager covers - used to suggest an assignee for new bookings
     pincodes: [{ type: String, trim: true }],

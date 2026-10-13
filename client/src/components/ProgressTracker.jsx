@@ -1,10 +1,13 @@
 import { Check } from 'lucide-react';
 
-const STEPS = ['Booked', 'Manager assigned', 'Visit scheduled', 'Site visited', 'Estimate ready', 'Approved', 'Work completed'];
-const STEP_OF = { new: 0, assigned: 1, scheduled: 2, visited: 3, estimate_sent: 4, revision_requested: 4, approved: 5, completed: 6 };
+const STEPS = ['Booked', 'Details verified', 'Inspector assigned', 'Visit scheduled', 'Site visited', 'Estimate ready', 'Approved', 'Work completed'];
+const STEP_OF = {
+  new: 0, crm_assigned: 0, awaiting_inspection: 1, assigned: 2, scheduled: 3, visited: 4,
+  estimate_sent: 5, revision_requested: 5, approved: 6, completed: 7,
+};
 
 export default function ProgressTracker({ status }) {
-  if (status === 'cancelled') return <p className="alert alert--error">This booking was cancelled. Call us or book a new visit if you still need help.</p>;
+  if (status === 'cancelled' || status === 'invalid') return <p className="alert alert--error">This booking was cancelled. Call us or book a new visit if you still need help.</p>;
   const current = STEP_OF[status] ?? 0;
 
   return (
